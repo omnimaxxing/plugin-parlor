@@ -1,0 +1,10 @@
+{
+  "name": "printer",
+  "description": "Send documents directly to your printer from Claude Code and Cowork. Auto-generates a cover sheet with every print job.",
+  "version": "2.0.0",
+  "author": {
+    "name": "Jake"
+  },
+  "license": "MIT",
+  "keywords": ["printer", "printing", "CUPS", "office"]
+}

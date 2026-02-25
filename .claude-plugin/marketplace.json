@@ -1,0 +1,17 @@
+{
+  "name": "plugin-parlor",
+  "owner": {
+    "name": "Jake"
+  },
+  "metadata": {
+    "description": "Jake's Plugin Parlor — custom plugins for Claude Code and Cowork"
+  },
+  "plugins": [
+    {
+      "name": "printer",
+      "source": "./plugins/printer",
+      "description": "Send documents to your printer with auto cover sheets. Dynamically discovers printer capabilities via CUPS.",
+      "version": "2.0.0"
+    }
+  ]
+}

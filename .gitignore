@@ -1,0 +1,8 @@
+# Plugin source files (dist is committed for distribution)
+plugins/*/src/
+plugins/*/tsconfig.json
+
+# Test artifacts
+*.txt
+*.html
+*.pdf

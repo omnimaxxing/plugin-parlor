@@ -1,0 +1,8 @@
+# Test files
+*.txt
+*.html
+*.pdf
+
+# Source (dist is committed for plugin distribution)
+src/
+tsconfig.json
