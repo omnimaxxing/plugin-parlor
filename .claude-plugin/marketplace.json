@@ -10,8 +10,8 @@
     {
       "name": "printer",
       "source": "./plugins/printer",
-      "description": "Send documents to your printer with auto cover sheets. Dynamically discovers printer capabilities via CUPS.",
-      "version": "2.0.0"
+      "description": "Send documents to your printer with auto cover sheets. Discovers printers on the network and adds them. Dynamic capability detection via CUPS.",
+      "version": "2.1.0"
     }
   ]
 }

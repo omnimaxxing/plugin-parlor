@@ -133,10 +133,80 @@ async function generateCoverSheet(fileName, coverNote) {
     await writeFile(tmpPath, content, "utf-8");
     return tmpPath;
 }
+/**
+ * Discover printers on the network via Bonjour/mDNS.
+ * Uses dns-sd to browse for _ipp._tcp and _ipps._tcp services.
+ * Returns deduplicated printer names with their URIs.
+ */
+async function discoverNetworkPrinters(timeoutSec = 4) {
+    // Run dns-sd with a timeout — it runs forever so we kill it
+    const results = [];
+    const seen = new Set();
+    // Browse both IPP and IPPS
+    for (const service of ["_ipp._tcp", "_ipps._tcp"]) {
+        try {
+            const { stdout } = await new Promise((resolve, reject) => {
+                const proc = execFile("dns-sd", ["-B", service], { timeout: (timeoutSec + 1) * 1000 }, (err, stdout, stderr) => {
+                    // dns-sd always "fails" because we kill it
+                    resolve({ stdout: stdout || "", stderr: stderr || "" });
+                });
+                setTimeout(() => proc.kill(), timeoutSec * 1000);
+            });
+            for (const line of stdout.split("\n")) {
+                // Parse: "Timestamp  A/R  Flags  if  Domain  ServiceType  InstanceName"
+                const match = line.match(/^\d+:\d+:\d+\.\d+\s+Add\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s+(.+)$/);
+                if (!match)
+                    continue;
+                const name = match[3].trim();
+                if (seen.has(name))
+                    continue;
+                seen.add(name);
+                results.push({ name, uri: `${service} on ${match[1]}` });
+            }
+        }
+        catch {
+            // dns-sd not available or timed out, skip
+        }
+    }
+    // Also get URIs from ippfind for printers that respond
+    try {
+        const { stdout: ippOut } = await exec("ippfind", ["-T", String(timeoutSec)], {
+            timeout: (timeoutSec + 2) * 1000,
+        }).catch(() => ({ stdout: "" }));
+        // Store ippfind URIs by hostname for matching
+        const ippUris = ippOut
+            .trim()
+            .split("\n")
+            .filter(Boolean);
+        // Try to match ippfind URIs back to dns-sd results by hostname
+        for (const uri of ippUris) {
+            try {
+                const hostname = new URL(uri).hostname.replace(".local.", ".local");
+                // Update any matching result with the actual IPP URI
+                for (const r of results) {
+                    if (hostname.toLowerCase().includes(r.name
+                        .replace(/[^a-zA-Z0-9]/g, "")
+                        .substring(0, 8)
+                        .toLowerCase()) ||
+                        r.name.toLowerCase().includes(hostname.replace(".local", "").substring(0, 8).toLowerCase())) {
+                        r.uri = uri;
+                    }
+                }
+            }
+            catch {
+                // URL parse failed, skip
+            }
+        }
+    }
+    catch {
+        // ippfind not available
+    }
+    return results;
+}
 // --- Server ---
 const server = new McpServer({
     name: "printer",
-    version: "2.0.0",
+    version: "2.1.0",
 });
 // Tool: list_printers
 server.tool("list_printers", "List all available printers and their status. Call this first to see what printers are available.", {}, async () => {
@@ -428,6 +498,166 @@ server.tool("cancel_print_job", "Cancel a print job by job ID, or cancel all job
                 {
                     type: "text",
                     text: `Cancel failed: ${err.message}`,
+                },
+            ],
+            isError: true,
+        };
+    }
+});
+// Tool: discover_printers
+server.tool("discover_printers", "Scan the local network for printers via Bonjour/mDNS. Shows ALL printers on the network, including ones not yet added to this Mac. Compare results with list_printers to find printers that need to be added.", {
+    timeout: z
+        .number()
+        .int()
+        .min(2)
+        .max(15)
+        .optional()
+        .describe("Network scan timeout in seconds (default 4)"),
+}, async ({ timeout }) => {
+    const scanTime = timeout || 4;
+    try {
+        const discovered = await discoverNetworkPrinters(scanTime);
+        if (discovered.length === 0) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: "No printers found on the network. Make sure you're connected to the office network.",
+                    },
+                ],
+            };
+        }
+        // Get already-configured printers for comparison
+        let configured = [];
+        try {
+            const { stdout } = await runCommand("lpstat", ["-v"]);
+            configured = stdout
+                .split("\n")
+                .map((l) => l.match(/^device for (\S+):/)?.[1])
+                .filter(Boolean);
+        }
+        catch {
+            // No printers configured yet
+        }
+        const lines = discovered.map((p) => {
+            // Check if this printer is already configured by matching name fragments
+            const nameNorm = p.name.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+            const isConfigured = configured.some((c) => c.replace(/[^a-zA-Z0-9]/g, "").toLowerCase().includes(nameNorm.substring(0, 10)) ||
+                nameNorm.includes(c.replace(/[^a-zA-Z0-9]/g, "").toLowerCase().substring(0, 10)));
+            const status = isConfigured ? " [already added]" : " [not configured]";
+            return `- ${p.name}${status}\n    ${p.uri}`;
+        });
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: [
+                        `Found ${discovered.length} printers on the network:`,
+                        "",
+                        ...lines,
+                        "",
+                        'Printers marked [not configured] can be added with add_printer.',
+                    ].join("\n"),
+                },
+            ],
+        };
+    }
+    catch (err) {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Discovery failed: ${err.message}`,
+                },
+            ],
+            isError: true,
+        };
+    }
+});
+// Tool: add_printer
+server.tool("add_printer", "Add a network printer to this Mac so you can print to it. Use discover_printers first to find the printer's URI. The printer is added via CUPS using AirPrint/IPP Everywhere drivers (driverless).", {
+    name: z
+        .string()
+        .describe('A short name for the printer (no spaces, used in commands). Example: "DesignJet_T2530"'),
+    uri: z
+        .string()
+        .describe('The printer URI from discover_printers. Example: "ipp://HP3822E28D5A1E.local:631/ipp/print"'),
+    description: z
+        .string()
+        .optional()
+        .describe('Human-readable description. Example: "HP DesignJet T2530 - Back Wall"'),
+    location: z
+        .string()
+        .optional()
+        .describe('Physical location. Example: "Back office wall"'),
+    setDefault: z
+        .boolean()
+        .optional()
+        .describe("Set as the default printer (default false)"),
+}, async ({ name, uri, description, location, setDefault }) => {
+    // Validate name has no spaces
+    if (/\s/.test(name)) {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: 'Printer name cannot contain spaces. Use underscores instead, e.g. "DesignJet_T2530".',
+                },
+            ],
+            isError: true,
+        };
+    }
+    try {
+        // Add printer using lpadmin with driverless (IPP Everywhere) driver
+        const args = [
+            "-p", name,
+            "-v", uri,
+            "-E", // Enable the printer
+            "-m", "everywhere", // Use IPP Everywhere / AirPrint driverless
+        ];
+        if (description) {
+            args.push("-D", description);
+        }
+        if (location) {
+            args.push("-L", location);
+        }
+        await runCommand("lpadmin", args);
+        // Set as default if requested
+        if (setDefault) {
+            await runCommand("lpoptions", ["-d", name]);
+        }
+        // Verify it was added
+        const { stdout: verify } = await runCommand("lpstat", ["-p", name]);
+        let text = `Printer "${name}" added successfully!\n`;
+        text += `URI: ${uri}\n`;
+        if (description)
+            text += `Description: ${description}\n`;
+        if (location)
+            text += `Location: ${location}\n`;
+        if (setDefault)
+            text += `Set as default printer.\n`;
+        text += `\nStatus: ${verify.trim()}`;
+        text += `\n\nYou can now use get_printer_capabilities to see its options, then print_file to send documents.`;
+        return { content: [{ type: "text", text }] };
+    }
+    catch (err) {
+        const msg = err.message;
+        if (msg.includes("forbidden") || msg.includes("not authorized")) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Permission denied adding printer. This may require admin privileges. Try running: sudo lpadmin -p ${name} -v "${uri}" -E -m everywhere`,
+                    },
+                ],
+                isError: true,
+            };
+        }
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Failed to add printer: ${msg}`,
                 },
             ],
             isError: true,
